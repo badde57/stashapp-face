@@ -1,0 +1,15 @@
+name: face
+description: Extract faces from scenes
+version: '1.0.0'
+url: https://github.com/badde57/stashapp-face
+exec:
+  - python
+  - "{pluginDir}/face.py"
+  - "{pluginDir}/../../../meta.sqlite"
+  - "/generated/face/"
+interface: raw
+tasks:
+  - name: Face extract scenes
+    description: Extract face embeddings from scenes
+    defaultArgs:
+      mode: catchup

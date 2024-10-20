@@ -1,0 +1,8 @@
+stashapp-tools
+opencv-python
+insightface
+torch==2.5.0
+onnxruntime-gpu
+tqdm
+numpy
+tensorrt
