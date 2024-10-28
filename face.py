@@ -3,7 +3,7 @@ import sys
 import json
 import sqlite3
 
-METHOD = 'face-1.0.0'
+METHOD = 'face-1.0.1'
 
 try:
     import stashapi.log as log
@@ -95,23 +95,24 @@ def checkface(scene):
             log.info(f"face - skipping {scene_id=}, already processed")
             continue
 
-        face_count = process_video(path, f"{face_dir_path}/{stash_id}")
-        cur.execute('INSERT INTO face (endpoint, stash_id, face_count, method) VALUES (?,?,?,?)',(endpoint, stash_id, face_count, METHOD,))
+        face_count = process_video(path, endpoint, stash_id)
+#        cur.execute('INSERT INTO face (endpoint, stash_id, face_count, method) VALUES (?,?,?,?)',(endpoint, stash_id, face_count, METHOD,))
         log.debug(f"face - finished {scene_id=}")
         return con.commit()
 
 def numpy_to_python(obj):
-    if isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, (list, tuple)):
+        return [numpy_to_python(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: numpy_to_python(value) for key, value in obj.items()}
     return obj
 
-def process_video(video_path, output_dir, frequency=2, face_score_threshold=0.5):
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+def process_video(video_path, endpoint, stash_id, frequency=2, face_score_threshold=0.5):
+    cur = con.cursor()
 
     # Open the video file
     cap = cv2.VideoCapture(video_path)
@@ -134,64 +135,38 @@ def process_video(video_path, output_dir, frequency=2, face_score_threshold=0.5)
                 break
 
             if frame_count % frame_interval == 0:
+                time_offset = round(frame_count / fps, 2)
+
                 try:
                     # Analyze the frame
                     faces = model.get(frame)
 
-                    # Reset face index for each processed frame
-                    face_index = 0
+                    total_face_count += len(faces)
+                    total_face_area = 0.0
+
+                    face_data = list()
 
                     for face in faces:
-                        # Check face detection confidence
-                        if hasattr(face, 'det_score') and face.det_score < face_score_threshold:
-                            log.debug(f"Low confidence face detection at frame {frame_count}, score: {face.det_score}")
+                        face_datum = process_face(face, frame, frame_count, face_score_threshold)
+                        if face_datum == None:
                             continue
+                        face_data.append(face_datum)
+                        total_face_area += face_datum['bbox']['frame_fraction']
 
-                        # Extract face attributes
-                        age = int(face.age)
-                        gender = 'M' if face.gender == 1 else 'F'
-                        embedding = face.embedding.tolist()
 
-                        # Save face image
-                        bbox = face.bbox.astype(int)
-                        face_img = frame[max(0, bbox[1]):min(frame.shape[0], bbox[3]),
-                                         max(0, bbox[0]):min(frame.shape[1], bbox[2])]
-
-                        if face_img.size == 0:
-                            log.warning(f"Skipping empty face image at frame {frame_count}")
-                            continue
-
-                        timestamp = timedelta(seconds=frame_count/fps)
-                        base_filename = f"T{timestamp.total_seconds():05.2f}_{gender}{age}_{face_index}"
-                        jpg_filename = f"{base_filename}.jpg"
-                        json_filename = f"{base_filename}.json"
-                        jpg_filepath = os.path.join(output_dir, jpg_filename)
-                        json_filepath = os.path.join(output_dir, json_filename)
-
-                        try:
-                            cv2.imwrite(jpg_filepath, face_img)
-                        except cv2.error as e:
-                            log.error(f"Error saving face image: {e}")
-                            continue
-
-                        # Prepare JSON data
-                        face_data = {
-                            "age": age,
-                            "gender": gender,
-                            "embedding": embedding,
+                    if len(face_data) > 0:
+                        log.info(total_face_area)
+                        d = json.dumps({
+                            "count": len(faces),
+                            "frame_fraction": total_face_area,
+                            "faces": face_data,
                             "model": "buffalo_l",
                             "method": f"insightface-{insightface_version}",
-                            "det_score": numpy_to_python(face.det_score) if hasattr(face, 'det_score') else None
-                        }
+                        })
 
-                        # Save JSON file
-                        with open(json_filepath, 'w') as json_file:
-                            json.dump(face_data, json_file)
-
-                        # Increment face index for this frame
-                        face_index += 1
-                        # Increment total face count
-                        total_face_count += 1
+                        cur.execute('INSERT INTO face (endpoint, stash_id, time_offset, faces, method) VALUES (?,?,?,?,?)',
+                            (endpoint, stash_id, time_offset, json.dumps(numpy_to_python(d)), METHOD,)
+                        )
 
                 except Exception as e:
                     log.error(f"Error processing frame {frame_count}: {e}")
@@ -200,9 +175,82 @@ def process_video(video_path, output_dir, frequency=2, face_score_threshold=0.5)
             pbar.update(1)  # Update the progress bar
 
     cap.release()
+    con.commit()
     log.info(f"Processed {frame_count} frames, detected {total_face_count} faces above threshold")
     return total_face_count
 
+def process_face(face, frame, frame_offset, face_score_threshold):
+    # Check face detection confidence
+    if hasattr(face, 'det_score') and face.det_score < face_score_threshold:
+        log.debug(f"Low confidence face detection at frame {frame_offset}, score: {face.det_score}")
+        return None
+
+    # Extract face attributes
+    age = int(face.age)
+    gender = 'M' if face.gender == 1 else 'F'
+    embedding = face.embedding.tolist()
+
+    # Save face image
+    bbox = face.bbox.astype(int)
+    real_coords, norm_coords, norm_face_coords, face_fraction = get_face_metrics(bbox, frame.shape)
+
+    if face_fraction == 0:
+        log.warning(f"Skipping empty face image at frame {frame_offset}")
+        return None
+
+    # Prepare JSON data
+    face_data = {
+        "age": age,
+        "gender": gender,
+        "bbox": {
+            "real": numpy_to_python(real_coords),
+            "normalized": numpy_to_python(norm_coords),
+            "face_normalized": numpy_to_python(norm_face_coords),
+            "frame_fraction": numpy_to_python(face_fraction),
+        },
+        "embedding": numpy_to_python(embedding),
+        "det_score": numpy_to_python(face.det_score) if hasattr(face, 'det_score') else None
+    }
+    return face_data
+
+def get_face_metrics(bbox, frame_shape):
+    """
+    Calculate various metrics for a detected face in a frame.
+    
+    Args:
+    bbox (np.array): Bounding box coordinates [x1, y1, x2, y2]
+    frame_shape (tuple): Shape of the frame (height, width, channels)
+    
+    Returns:
+    tuple: (real_coords, norm_coords, norm_face_coords, face_fraction)
+    """
+    frame_height, frame_width = frame_shape[:2]
+    
+    # 1. Real coordinates (in pixels)
+    x1, y1 = max(0, bbox[0]), max(0, bbox[1])
+    x2, y2 = min(frame_width, bbox[2]), min(frame_height, bbox[3])
+    real_coords = (x1, y1, x2, y2)
+    
+    # 2. Normalized coordinates of the face in the frame
+    norm_x1, norm_y1 = x1 / frame_width, y1 / frame_height
+    norm_x2, norm_y2 = x2 / frame_width, y2 / frame_height
+    norm_coords = (norm_x1, norm_y1, norm_x2, norm_y2)
+    
+    # 3. Normalized coordinates of the actual face
+    face_width = bbox[2] - bbox[0]
+    face_height = bbox[3] - bbox[1]
+    norm_face_x1 = max(0, -bbox[0] / face_width)
+    norm_face_y1 = max(0, -bbox[1] / face_height)
+    norm_face_x2 = min(1, (frame_width - bbox[0]) / face_width)
+    norm_face_y2 = min(1, (frame_height - bbox[1]) / face_height)
+    norm_face_coords = (norm_face_x1, norm_face_y1, norm_face_x2, norm_face_y2)
+    
+    # 4. Fraction of the frame filled with the face
+    face_area = (x2 - x1) * (y2 - y1)
+    frame_area = frame_width * frame_height
+    face_fraction = face_area / frame_area
+    
+    return real_coords, norm_coords, norm_face_coords, face_fraction
 
 def main():
     global stash
