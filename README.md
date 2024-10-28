@@ -19,14 +19,15 @@ Performer tagging.
     CREATE TABLE face (
       endpoint TEXT NOT NULL,
       stash_id TEXT NOT NULL,
-      face_count INT NOT NULL,
+      time_offset FLOAT NOT NULL,
+      faces TEXT NOT NULL,
       method TEXT NOT NULL, 
-      UNIQUE (stash_id, method)
+      UNIQUE (stash_id, time_offset, method)
     );
-  " | sqlite3 /path/to/face.sqlite
+  " | sqlite3 /path/to/meta.sqlite
 
 2. Update `face.yml` to use the path to the sqlite datbase you created. In the
-   config, it's by default: `  - "{pluginDir}/../face.sqlite"`
+   config, it's by default: `  - "{pluginDir}/../meta.sqlite"`
   Change accordingly.
 
 3. Similarly, if you want to change the output directory for face images and
